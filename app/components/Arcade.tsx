@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Category, Phrase, getPhrasesForSession, CATEGORY_META } from '@/lib/phrases';
-import { speak, listen, compareTranscripts, hasSpeechRecognition, hasSpeechSynthesis, RecognitionResult } from '@/lib/speech';
+import { speak, listen, compareTranscripts, hasSpeechRecognition, hasSpeechSynthesis, getCapabilityMessage, RecognitionResult } from '@/lib/speech';
+import { recordSession, saveWord, isWordSaved, getWeakPhraseIds } from '@/lib/store';
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -39,13 +40,23 @@ export default function Arcade({ category, onExit }: {
   const [lastComparison, setLastComparison] = useState<ReturnType<typeof compareTranscripts> | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [hasVoice, setHasVoice] = useState(true);
+  const [canSpeak, setCanSpeak] = useState(false);
+  const [canListen, setCanListen] = useState(false);
+  const [capabilityNote, setCapabilityNote] = useState('');
   const [showEnglish, setShowEnglish] = useState(false);
+  const [wordJustSaved, setWordJustSaved] = useState(false);
 
-  // Initialize session
+  // Initialize session — detect capabilities separately
   useEffect(() => {
-    setPhrases(getPhrasesForSession(category, ROUNDS_PER_SESSION));
-    setHasVoice(hasSpeechRecognition() && hasSpeechSynthesis());
+    const tts = hasSpeechSynthesis();
+    const stt = hasSpeechRecognition();
+    setCanSpeak(tts);
+    setCanListen(stt);
+    const cap = getCapabilityMessage();
+    setCapabilityNote(cap.message);
+
+    const weakIds = getWeakPhraseIds(2);
+    setPhrases(getPhrasesForSession(category, ROUNDS_PER_SESSION, weakIds));
   }, [category]);
 
   const currentPhrase = phrases[currentRound];
@@ -66,13 +77,13 @@ export default function Arcade({ category, onExit }: {
     setIsSpeaking(false);
   }, [currentPhrase, isSpeaking]);
 
-  // Auto-play on present
+  // Auto-play on present (only if TTS available)
   useEffect(() => {
-    if (roundPhase === 'presenting' && currentPhrase && hasVoice) {
+    if (roundPhase === 'presenting' && currentPhrase && canSpeak) {
       const timer = setTimeout(() => playPhrase(), 600);
       return () => clearTimeout(timer);
     }
-  }, [roundPhase, currentPhrase, hasVoice, playPhrase]);
+  }, [roundPhase, currentPhrase, canSpeak, playPhrase]);
 
   const startRecording = useCallback(async () => {
     if (!currentPhrase || isRecording) return;
@@ -105,7 +116,7 @@ export default function Arcade({ category, onExit }: {
         setLastComparison({ similarity: 0, matchedWords: 0, totalWords: 0, feedback: 'Kein Audio erkannt. Versuch es noch einmal.' });
         setRoundPhase('feedback');
       } else if (msg === 'not-allowed' || msg === 'service-not-allowed') {
-        setHasVoice(false);
+        setCanListen(false);
         setRoundPhase('presenting');
       } else {
         setRoundPhase('presenting');
@@ -127,6 +138,7 @@ export default function Arcade({ category, onExit }: {
       feedback: lastComparison?.feedback || '',
       skipped: !lastAttempt,
     }]);
+    setWordJustSaved(false);
     setRoundPhase('notice');
   }, [currentPhrase, lastAttempt, lastComparison]);
 
@@ -139,6 +151,7 @@ export default function Arcade({ category, onExit }: {
       setLastAttempt(null);
       setLastComparison(null);
       setShowEnglish(false);
+      setWordJustSaved(false);
     }
   }, [currentRound, phrases.length]);
 
@@ -154,8 +167,26 @@ export default function Arcade({ category, onExit }: {
       skipped: true,
     }]);
     setStreak(0);
-    nextRound();
-  }, [currentPhrase, nextRound]);
+    // Go straight to notice — don't skip the soul of the app
+    setWordJustSaved(false);
+    setRoundPhase('notice');
+  }, [currentPhrase]);
+
+  // "Listen only" advance — for when STT isn't available
+  const advanceListenOnly = useCallback(() => {
+    if (!currentPhrase) return;
+    setResults(prev => [...prev, {
+      phrase: currentPhrase,
+      attempt: '',
+      similarity: 0,
+      matchedWords: 0,
+      totalWords: 0,
+      feedback: '',
+      skipped: true,
+    }]);
+    setWordJustSaved(false);
+    setRoundPhase('notice');
+  }, [currentPhrase]);
 
   const retryRound = useCallback(() => {
     setRoundPhase('presenting');
@@ -163,20 +194,45 @@ export default function Arcade({ category, onExit }: {
     setLastComparison(null);
   }, []);
 
+  const handleSaveWord = useCallback(() => {
+    if (!currentPhrase) return;
+    saveWord(currentPhrase.notice, currentPhrase.noticeNote, currentPhrase.german);
+    setWordJustSaved(true);
+  }, [currentPhrase]);
+
   // ─── Summary Screen ──────────────────────────────────
 
   if (sessionPhase === 'summary') {
-    return <SessionSummary results={results} bestStreak={bestStreak} category={categoryMeta} onExit={onExit} onPlayAgain={() => {
-      setPhrases(getPhrasesForSession(category, ROUNDS_PER_SESSION));
-      setCurrentRound(0);
-      setRoundPhase('presenting');
-      setResults([]);
-      setStreak(0);
-      setBestStreak(0);
-      setSessionPhase('playing');
-      setLastAttempt(null);
-      setLastComparison(null);
-    }} />;
+    // Persist session to localStorage
+    recordSession(
+      results.map(r => ({
+        phraseId: r.phrase.id,
+        similarity: r.similarity,
+        skipped: r.skipped,
+      })),
+      bestStreak,
+    );
+
+    return <SessionSummary
+      results={results}
+      bestStreak={bestStreak}
+      category={categoryMeta}
+      canListen={canListen}
+      onExit={onExit}
+      onPlayAgain={() => {
+        const weakIds = getWeakPhraseIds(2);
+        setPhrases(getPhrasesForSession(category, ROUNDS_PER_SESSION, weakIds));
+        setCurrentRound(0);
+        setRoundPhase('presenting');
+        setResults([]);
+        setStreak(0);
+        setBestStreak(0);
+        setSessionPhase('playing');
+        setLastAttempt(null);
+        setLastComparison(null);
+        setWordJustSaved(false);
+      }}
+    />;
   }
 
   if (!currentPhrase) return null;
@@ -212,6 +268,13 @@ export default function Arcade({ category, onExit }: {
           />
         </div>
       </div>
+
+      {/* Capability notice — shown once at top if degraded */}
+      {capabilityNote && currentRound === 0 && roundPhase === 'presenting' && (
+        <div className="mx-5 mb-3 px-4 py-2.5 rounded-xl bg-surface-raised border border-accent/20 animate-fade-in">
+          <p className="text-xs text-ink-muted leading-relaxed">{capabilityNote}</p>
+        </div>
+      )}
 
       {/* Main content */}
       <main className="flex-1 flex flex-col items-center justify-center px-6 py-8">
@@ -260,32 +323,50 @@ export default function Arcade({ category, onExit }: {
                   style={{ width: `${lastComparison.similarity * 100}%` }}
                 />
               </div>
-              <span className="text-xs font-mono text-ink-muted w-12 text-right">
-                {lastComparison.matchedWords}/{lastComparison.totalWords}
+              <span className="text-xs font-mono text-ink-muted w-16 text-right">
+                {lastComparison.matchedWords}/{lastComparison.totalWords} Wörter
               </span>
             </div>
 
             {/* Attempt transcript */}
             {lastAttempt.transcript && (
               <div className="bg-surface-raised border border-border rounded-xl px-4 py-3 mb-3">
-                <p className="text-xs font-mono text-ink-faint mb-1">Du hast gesagt:</p>
+                <p className="text-xs font-mono text-ink-faint mb-1">Erkannt:</p>
                 <p className="text-sm text-ink leading-relaxed">{lastAttempt.transcript}</p>
               </div>
             )}
 
-            {/* Feedback */}
+            {/* Feedback — honest about what's measured */}
             <p className="text-sm text-ink-muted text-center font-serif italic">
               {lastComparison.feedback}
+            </p>
+            <p className="text-xs text-ink-faint text-center font-mono mt-1">
+              Wortabgleich — keine Aussprachebewertung
             </p>
           </div>
         )}
 
-        {/* Notice (word spotlight) */}
+        {/* Notice (word spotlight) — the soul of the app */}
         {roundPhase === 'notice' && (
           <div className="w-full max-w-md mb-8 animate-fade-up">
-            <div className="bg-surface-raised border border-accent/20 rounded-xl px-5 py-4">
-              <p className="text-xs font-mono text-accent mb-2">Wort zum Merken</p>
-              <p className="font-serif text-xl text-german mb-1">{currentPhrase.notice}</p>
+            <div className="bg-surface-raised border border-accent/30 rounded-xl px-5 py-5 shadow-sm shadow-accent-glow">
+              <div className="flex items-start justify-between mb-3">
+                <p className="text-xs font-mono text-accent">Wort zum Merken</p>
+                <button
+                  onClick={handleSaveWord}
+                  disabled={wordJustSaved || isWordSaved(currentPhrase.notice, currentPhrase.german)}
+                  className={`text-xs font-mono transition-all duration-200 ${
+                    wordJustSaved || isWordSaved(currentPhrase.notice, currentPhrase.german)
+                      ? 'text-german'
+                      : 'text-ink-faint hover:text-accent'
+                  }`}
+                >
+                  {wordJustSaved || isWordSaved(currentPhrase.notice, currentPhrase.german)
+                    ? '✓ gemerkt'
+                    : '+ merken'}
+                </button>
+              </div>
+              <p className="font-serif text-2xl text-german mb-2">{currentPhrase.notice}</p>
               <p className="text-sm text-ink-muted leading-relaxed">{currentPhrase.noticeNote}</p>
             </div>
           </div>
@@ -295,24 +376,34 @@ export default function Arcade({ category, onExit }: {
         <div className="flex flex-col items-center gap-3 w-full max-w-sm">
           {roundPhase === 'presenting' && (
             <>
-              {/* Play button */}
-              <button
-                onClick={playPhrase}
-                disabled={isSpeaking}
-                className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300
-                  ${isSpeaking
-                    ? 'bg-accent/20 text-accent scale-105'
-                    : 'bg-surface-raised border border-border hover:border-accent text-ink-muted hover:text-accent'
-                  }`}
-              >
-                <span className="text-2xl">{isSpeaking ? '🔊' : '▶'}</span>
-              </button>
-              <p className="text-xs font-mono text-ink-faint">
-                {isSpeaking ? 'spielt ab…' : 'nochmal hören'}
-              </p>
+              {/* Play button — shown if TTS available */}
+              {canSpeak && (
+                <>
+                  <button
+                    onClick={playPhrase}
+                    disabled={isSpeaking}
+                    className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300
+                      ${isSpeaking
+                        ? 'bg-accent/20 text-accent scale-105'
+                        : 'bg-surface-raised border border-border hover:border-accent text-ink-muted hover:text-accent'
+                      }`}
+                  >
+                    <span className="text-2xl">{isSpeaking ? '🔊' : '▶'}</span>
+                  </button>
+                  <p className="text-xs font-mono text-ink-faint">
+                    {isSpeaking ? 'spielt ab…' : 'nochmal hören'}
+                  </p>
+                </>
+              )}
 
-              {/* Record */}
-              {hasVoice ? (
+              {!canSpeak && (
+                <p className="text-xs text-ink-faint font-mono text-center mb-2">
+                  Kein Audio-Playback in diesem Browser — lies mit und sprich leise mit.
+                </p>
+              )}
+
+              {/* Record — shown if STT available */}
+              {canListen ? (
                 <button
                   onClick={startRecording}
                   className="w-full py-3.5 rounded-xl bg-german text-surface font-medium
@@ -321,14 +412,20 @@ export default function Arcade({ category, onExit }: {
                   Jetzt sprechen
                 </button>
               ) : (
-                <p className="text-xs text-ink-faint font-mono text-center">
-                  Spracherkennung nicht verfügbar in diesem Browser.
-                </p>
+                <button
+                  onClick={advanceListenOnly}
+                  className="w-full py-3.5 rounded-xl bg-german text-surface font-medium
+                    transition-all duration-200 hover:shadow-lg hover:shadow-german-glow active:scale-[0.98]"
+                >
+                  {canSpeak ? 'Nachgesprochen — weiter' : 'Gelesen — weiter'}
+                </button>
               )}
 
-              <button onClick={skipRound} className="text-xs font-mono text-ink-faint hover:text-ink-muted transition-colors">
-                überspringen →
-              </button>
+              {canListen && (
+                <button onClick={skipRound} className="text-xs font-mono text-ink-faint hover:text-ink-muted transition-colors">
+                  überspringen →
+                </button>
+              )}
             </>
           )}
 
@@ -380,10 +477,11 @@ export default function Arcade({ category, onExit }: {
 
 // ─── Session Summary ─────────────────────────────────────
 
-function SessionSummary({ results, bestStreak, category, onExit, onPlayAgain }: {
+function SessionSummary({ results, bestStreak, category, canListen, onExit, onPlayAgain }: {
   results: RoundResult[];
   bestStreak: number;
   category: { label: string; emoji: string };
+  canListen: boolean;
   onExit: () => void;
   onPlayAgain: () => void;
 }) {
@@ -393,11 +491,26 @@ function SessionSummary({ results, bestStreak, category, onExit, onPlayAgain }: 
     ? attempted.reduce((s, r) => s + r.similarity, 0) / attempted.length
     : 0;
 
+  // Different verdict paths depending on whether STT was available
   let sessionVerdict: string;
-  if (avgSimilarity >= 0.8) sessionVerdict = 'Stark. Das sitzt.';
-  else if (avgSimilarity >= 0.6) sessionVerdict = 'Gut. Du wirst sicherer.';
-  else if (avgSimilarity >= 0.4) sessionVerdict = 'Auf dem Weg. Weitermachen.';
-  else sessionVerdict = 'Ein Anfang. Jedes Mal wird es leichter.';
+  if (!canListen) {
+    sessionVerdict = 'Gut zugehört. Jedes Mal sitzt es tiefer.';
+  } else if (avgSimilarity >= 0.8) {
+    sessionVerdict = 'Stark. Das sitzt.';
+  } else if (avgSimilarity >= 0.6) {
+    sessionVerdict = 'Gut. Du wirst sicherer.';
+  } else if (avgSimilarity >= 0.4) {
+    sessionVerdict = 'Auf dem Weg. Weitermachen.';
+  } else {
+    sessionVerdict = 'Ein Anfang. Jedes Mal wird es leichter.';
+  }
+
+  // Collect notice words from this session
+  const sessionWords = results.map(r => ({
+    word: r.phrase.notice,
+    note: r.phrase.noticeNote,
+    german: r.phrase.german,
+  }));
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-6 py-12">
@@ -411,36 +524,67 @@ function SessionSummary({ results, bestStreak, category, onExit, onPlayAgain }: 
           </p>
         </div>
 
-        {/* Stats */}
-        <div className="grid grid-cols-3 gap-3 mb-8 animate-fade-up" style={{ animationDelay: '0.1s' }}>
+        {/* Stats — only show match stats if STT was used */}
+        <div className={`grid ${canListen ? 'grid-cols-3' : 'grid-cols-2'} gap-3 mb-8 animate-fade-up`} style={{ animationDelay: '0.1s' }}>
           <StatBox label="Runden" value={`${results.length}`} />
-          <StatBox label="Treffer" value={`${strong.length}/${attempted.length}`} color="german" />
+          {canListen && (
+            <StatBox label="Treffer" value={`${strong.length}/${attempted.length}`} sub="Wortabgleich" color="german" />
+          )}
           <StatBox label="Streak" value={`${bestStreak}`} color="streak" />
         </div>
 
-        {/* Round review */}
-        <div className="space-y-2 mb-8 animate-fade-up" style={{ animationDelay: '0.2s' }}>
-          {results.map((r, i) => (
-            <div key={i} className="flex items-center gap-3 bg-surface-raised rounded-xl px-4 py-3">
-              <span className={`text-sm font-mono w-6 ${
-                r.skipped ? 'text-ink-faint' :
-                r.similarity >= 0.7 ? 'text-german' :
-                r.similarity >= 0.4 ? 'text-accent' : 'text-miss'
-              }`}>
-                {r.skipped ? '—' : r.similarity >= 0.7 ? '✓' : r.similarity >= 0.4 ? '~' : '✗'}
-              </span>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-ink truncate">{r.phrase.german}</p>
-                <p className="text-xs text-ink-faint font-mono truncate">{r.phrase.notice}</p>
-              </div>
-              {!r.skipped && (
-                <span className="text-xs font-mono text-ink-faint">
-                  {Math.round(r.similarity * 100)}%
-                </span>
-              )}
-            </div>
-          ))}
+        {/* Session Merkwörter */}
+        <div className="mb-6 animate-fade-up" style={{ animationDelay: '0.15s' }}>
+          <p className="text-xs font-mono text-accent mb-3">Wörter dieser Sitzung</p>
+          <div className="space-y-1.5">
+            {sessionWords.map((w, i) => {
+              const saved = isWordSaved(w.word, w.german);
+              return (
+                <div key={i} className="flex items-center justify-between bg-surface-raised rounded-lg px-4 py-2.5">
+                  <span className="font-serif text-sm text-german">{w.word}</span>
+                  <button
+                    onClick={() => !saved && saveWord(w.word, w.note, w.german)}
+                    className={`text-xs font-mono transition-colors ${
+                      saved ? 'text-german' : 'text-ink-faint hover:text-accent'
+                    }`}
+                  >
+                    {saved ? '✓' : '+ merken'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </div>
+
+        {/* Round review */}
+        {canListen && attempted.length > 0 && (
+          <div className="space-y-2 mb-8 animate-fade-up" style={{ animationDelay: '0.2s' }}>
+            <p className="text-xs font-mono text-ink-faint mb-2">Runden</p>
+            {results.map((r, i) => (
+              <div key={i} className="flex items-center gap-3 bg-surface-raised rounded-xl px-4 py-3">
+                <span className={`text-sm font-mono w-6 ${
+                  r.skipped ? 'text-ink-faint' :
+                  r.similarity >= 0.7 ? 'text-german' :
+                  r.similarity >= 0.4 ? 'text-accent' : 'text-miss'
+                }`}>
+                  {r.skipped ? '—' : r.similarity >= 0.7 ? '✓' : r.similarity >= 0.4 ? '~' : '✗'}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-ink truncate">{r.phrase.german}</p>
+                  <p className="text-xs text-ink-faint font-mono truncate">{r.phrase.notice}</p>
+                </div>
+                {!r.skipped && (
+                  <span className="text-xs font-mono text-ink-faint">
+                    {Math.round(r.similarity * 100)}%
+                  </span>
+                )}
+              </div>
+            ))}
+            <p className="text-xs text-ink-faint font-mono text-center mt-1">
+              Prozent = erkannte Wörter in Reihenfolge, nicht Aussprache
+            </p>
+          </div>
+        )}
 
         {/* Actions */}
         <div className="space-y-3 animate-fade-up" style={{ animationDelay: '0.3s' }}>
@@ -469,12 +613,13 @@ function SessionSummary({ results, bestStreak, category, onExit, onPlayAgain }: 
   );
 }
 
-function StatBox({ label, value, color }: { label: string; value: string; color?: string }) {
+function StatBox({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) {
   const textColor = color === 'german' ? 'text-german' : color === 'streak' ? 'text-streak' : 'text-ink';
   return (
     <div className="bg-surface-raised rounded-xl px-3 py-3 text-center">
       <p className={`text-2xl font-mono font-medium ${textColor}`}>{value}</p>
       <p className="text-xs font-mono text-ink-faint mt-1">{label}</p>
+      {sub && <p className="text-[10px] font-mono text-ink-faint mt-0.5">{sub}</p>}
     </div>
   );
 }

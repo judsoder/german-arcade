@@ -241,7 +241,19 @@ export function getPhrasesForCategory(category: Category): Phrase[] {
   return PHRASES.filter(p => p.category === category);
 }
 
-export function getPhrasesForSession(category: Category | 'mixed', count: number = 5): Phrase[] {
+export function getPhraseById(id: string): Phrase | undefined {
+  return PHRASES.find(p => p.id === id);
+}
+
+/**
+ * Build a session of `count` phrases, optionally seeding with
+ * weak phrases the user has struggled with before.
+ */
+export function getPhrasesForSession(
+  category: Category | 'mixed',
+  count: number = 5,
+  weakPhraseIds: string[] = [],
+): Phrase[] {
   let pool: Phrase[];
   if (category === 'mixed') {
     pool = [...PHRASES];
@@ -249,7 +261,26 @@ export function getPhrasesForSession(category: Category | 'mixed', count: number
     pool = PHRASES.filter(p => p.category === category);
   }
 
-  // Shuffle
-  const shuffled = pool.sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.min(count, shuffled.length));
+  // Pull weak phrases first (max 2 per session to avoid frustration)
+  const weakPhrases: Phrase[] = [];
+  const weakToSeed = weakPhraseIds.slice(0, 2);
+  for (const id of weakToSeed) {
+    const phrase = pool.find(p => p.id === id);
+    if (phrase) weakPhrases.push(phrase);
+  }
+
+  // Fill remaining slots from pool, excluding already-picked weak phrases
+  const weakIds = new Set(weakPhrases.map(p => p.id));
+  const remaining = pool.filter(p => !weakIds.has(p.id));
+  const shuffled = remaining.sort(() => Math.random() - 0.5);
+  const fresh = shuffled.slice(0, Math.max(0, count - weakPhrases.length));
+
+  // Interleave: weak phrases go at positions 1 and 3 (not first, not last)
+  const session = [...fresh];
+  for (let i = 0; i < weakPhrases.length; i++) {
+    const insertAt = Math.min(1 + i * 2, session.length);
+    session.splice(insertAt, 0, weakPhrases[i]);
+  }
+
+  return session.slice(0, count);
 }

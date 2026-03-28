@@ -1,12 +1,78 @@
 /**
  * Speech utilities — browser TTS and recognition.
+ * 
+ * TTS and STT are detected and exposed SEPARATELY.
+ * The app should never gate the whole experience on both being present.
  */
+
+// ─── Feature detection ──────────────────────────────────
+
+export function hasSpeechSynthesis(): boolean {
+  if (typeof window === 'undefined') return false;
+  return 'speechSynthesis' in window;
+}
+
+export function hasSpeechRecognition(): boolean {
+  if (typeof window === 'undefined') return false;
+  return !!(
+    (window as unknown as Record<string, unknown>).SpeechRecognition ||
+    (window as unknown as Record<string, unknown>).webkitSpeechRecognition
+  );
+}
+
+/**
+ * Returns a human-readable capability summary for the current browser.
+ */
+export function getCapabilityMessage(): {
+  canListen: boolean;
+  canSpeak: boolean;
+  message: string;
+  mode: 'full' | 'listen-only' | 'read-only';
+} {
+  const canSpeak = hasSpeechSynthesis();
+  const canListen = hasSpeechRecognition();
+
+  if (canSpeak && canListen) {
+    return {
+      canListen: true,
+      canSpeak: true,
+      message: '',
+      mode: 'full',
+    };
+  }
+
+  if (canSpeak && !canListen) {
+    return {
+      canListen: false,
+      canSpeak: true,
+      message: 'Speech recognition is not available in this browser. You can still listen and shadow along — the app just can\'t check what you said.',
+      mode: 'listen-only',
+    };
+  }
+
+  if (!canSpeak && canListen) {
+    return {
+      canListen: true,
+      canSpeak: false,
+      message: 'Text-to-speech is not available in this browser. You can read the phrases and record yourself, but audio playback won\'t work.',
+      mode: 'full', // STT still works, just no auto-play
+    };
+  }
+
+  return {
+    canListen: false,
+    canSpeak: false,
+    message: 'This browser supports neither speech synthesis nor recognition. You can still read the phrases and practice silently.',
+    mode: 'read-only',
+  };
+}
+
 
 // ─── Text-to-Speech ─────────────────────────────────────
 
 export function speak(text: string, lang: string = 'de-DE', rate: number = 0.85): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (!('speechSynthesis' in window)) {
+    if (!hasSpeechSynthesis()) {
       reject(new Error('Speech synthesis not supported'));
       return;
     }
@@ -84,7 +150,49 @@ export function listen(lang: string = 'de-DE', timeoutMs: number = 8000): Promis
   });
 }
 
-// ─── Comparison ─────────────────────────────────────────
+// ─── Transcript Comparison ──────────────────────────────
+//
+// This compares WORDS IN SEQUENCE, not pronunciation.
+// It uses longest-common-subsequence to measure how much of the
+// original phrase was captured in order. This is more defensible
+// than bag-of-words but still only measures what the browser's
+// speech-to-text engine returned — NOT how you sounded.
+
+function normalize(s: string): string[] {
+  return s.toLowerCase()
+    .replace(/[.,!?;:'"„"–—\-]/g, '')
+    .replace(/ß/g, 'ss')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(w => w.length > 0);
+}
+
+/**
+ * Longest common subsequence length between two word arrays.
+ * Respects word order — "ich bin müde" vs "müde bin ich" scores lower
+ * than a bag-of-words approach would.
+ */
+function lcsLength(a: string[], b: string[]): number {
+  const m = a.length;
+  const n = b.length;
+  // Space-optimized LCS
+  let prev = new Array(n + 1).fill(0);
+  let curr = new Array(n + 1).fill(0);
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        curr[j] = prev[j - 1] + 1;
+      } else {
+        curr[j] = Math.max(prev[j], curr[j - 1]);
+      }
+    }
+    [prev, curr] = [curr, prev];
+    curr.fill(0);
+  }
+  return prev[n];
+}
 
 export function compareTranscripts(original: string, attempt: string): {
   similarity: number;
@@ -92,28 +200,23 @@ export function compareTranscripts(original: string, attempt: string): {
   totalWords: number;
   feedback: string;
 } {
-  const normalize = (s: string) => s.toLowerCase()
-    .replace(/[.,!?;:'"„"–—]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const origWords = normalize(original);
+  const attemptWords = normalize(attempt);
 
-  const origWords = normalize(original).split(' ');
-  const attemptWords = normalize(attempt).split(' ');
-
-  let matched = 0;
-  for (const word of origWords) {
-    if (attemptWords.includes(word)) matched++;
+  if (origWords.length === 0) {
+    return { similarity: 0, matchedWords: 0, totalWords: 0, feedback: '' };
   }
 
-  const similarity = origWords.length > 0 ? matched / origWords.length : 0;
+  const matched = lcsLength(origWords, attemptWords);
+  const similarity = matched / origWords.length;
 
   let feedback: string;
   if (similarity >= 0.9) {
-    feedback = 'Sehr gut. Fast perfekt.';
+    feedback = 'Sehr nah dran. Fast jedes Wort erfasst.';
   } else if (similarity >= 0.7) {
     feedback = 'Gut. Die meisten Wörter stimmen.';
   } else if (similarity >= 0.5) {
-    feedback = 'Auf dem richtigen Weg. Hör noch einmal zu.';
+    feedback = 'Auf dem Weg. Hör noch einmal genau hin.';
   } else if (similarity > 0) {
     feedback = 'Ein Anfang. Versuch es langsamer.';
   } else {
@@ -121,17 +224,4 @@ export function compareTranscripts(original: string, attempt: string): {
   }
 
   return { similarity, matchedWords: matched, totalWords: origWords.length, feedback };
-}
-
-// ─── Feature detection ──────────────────────────────────
-
-export function hasSpeechRecognition(): boolean {
-  return !!(
-    (window as unknown as Record<string, unknown>).SpeechRecognition ||
-    (window as unknown as Record<string, unknown>).webkitSpeechRecognition
-  );
-}
-
-export function hasSpeechSynthesis(): boolean {
-  return 'speechSynthesis' in window;
 }
