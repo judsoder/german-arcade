@@ -70,30 +70,85 @@ export function getCapabilityMessage(): {
 
 // ─── Text-to-Speech ─────────────────────────────────────
 
+// Cache voices once loaded
+let cachedVoices: SpeechSynthesisVoice[] = [];
+
+function loadVoices(): Promise<SpeechSynthesisVoice[]> {
+  return new Promise((resolve) => {
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      cachedVoices = voices;
+      resolve(voices);
+      return;
+    }
+    // Voices load asynchronously on many browsers (especially mobile)
+    window.speechSynthesis.onvoiceschanged = () => {
+      cachedVoices = window.speechSynthesis.getVoices();
+      resolve(cachedVoices);
+    };
+    // Fallback timeout — don't block forever
+    setTimeout(() => resolve(window.speechSynthesis.getVoices()), 1000);
+  });
+}
+
 export function speak(text: string, lang: string = 'de-DE', rate: number = 0.85): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     if (!hasSpeechSynthesis()) {
       reject(new Error('Speech synthesis not supported'));
       return;
     }
 
-    // Cancel any ongoing speech
+    // Cancel any ongoing speech, then small delay to avoid iOS WebKit bug
+    // where cancel() immediately before speak() silently drops the utterance
     window.speechSynthesis.cancel();
+    await new Promise(r => setTimeout(r, 50));
+
+    // Ensure voices are loaded
+    const voices = cachedVoices.length > 0 ? cachedVoices : await loadVoices();
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = lang;
     utterance.rate = rate;
     utterance.pitch = 1.0;
 
-    // Try to find a German voice
-    const voices = window.speechSynthesis.getVoices();
+    // Try to find a German voice — prefer local (offline) voices
     const germanVoice = voices.find(v => v.lang.startsWith('de') && v.localService) ||
                         voices.find(v => v.lang.startsWith('de'));
     if (germanVoice) utterance.voice = germanVoice;
 
     utterance.onend = () => resolve();
-    utterance.onerror = (e) => reject(e);
+    utterance.onerror = (e) => {
+      // Some browsers fire error for 'interrupted' when cancel() was called — not a real error
+      if (e.error === 'interrupted' || e.error === 'canceled') {
+        resolve();
+      } else {
+        reject(e);
+      }
+    };
+
+    // iOS Safari workaround: speechSynthesis can get "stuck" in a paused state
+    // Resume it before speaking, just in case
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
+
     window.speechSynthesis.speak(utterance);
+
+    // iOS Safari workaround #2: utterances longer than ~15s can get stuck.
+    // Periodically poke the synthesis to keep it alive.
+    const keepAlive = setInterval(() => {
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.pause();
+        window.speechSynthesis.resume();
+      } else {
+        clearInterval(keepAlive);
+      }
+    }, 10000);
+
+    utterance.onend = () => {
+      clearInterval(keepAlive);
+      resolve();
+    };
   });
 }
 
